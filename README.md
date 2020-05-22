@@ -1,2 +1,2 @@
-# aws-cdk-examples
+# AWS CDK Examples
 Examples using CDK for AWS infrastructure

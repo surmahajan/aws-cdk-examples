@@ -1,0 +1,234 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Creates a static website hosting with a code build for deployment"
+Parameters:
+  ApiName:
+    Type: String
+    Description: API Gateway name for exposing the static website backend
+  StaticWebsiteDomain:
+    Type: String
+    Description: Domain name for the CloudFront
+  CloudFrontCertARN:
+    Type: String
+    Description: ACM certificate ARN for the TLS
+  StageName:
+    Type: String
+    Description: Stage for the API Gateway
+Resources:
+  # S3 Bucket for hosting the static website
+  S3StaticHostingBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain # S3 bucket cannot be deleted when non empty
+    Properties:
+      AccessControl: BucketOwnerFullControl
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: True
+        BlockPublicPolicy: True
+        IgnorePublicAcls: True
+        RestrictPublicBuckets: True
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: error.html
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  # Create the CloudFront Distribution for the S3 Bucket
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Aliases:
+          - !Ref StaticWebsiteDomain
+        DefaultCacheBehavior:
+          Compress: true
+          ForwardedValues:
+            QueryString: false
+          TargetOriginId: the-s3-bucket
+          ViewerProtocolPolicy: redirect-to-https
+        DefaultRootObject: index.html
+        CustomErrorResponses:
+          - ErrorCachingMinTTL: 300
+            ErrorCode: 403
+            ResponseCode: 404
+            ResponsePagePath: /error.html
+        Enabled: true
+        HttpVersion: http2
+        ViewerCertificate:
+          SslSupportMethod: "sni-only"
+          MinimumProtocolVersion: "TLSv1.2_2018"
+          AcmCertificateArn: !Ref CloudFrontCertARN
+        Origins:
+          - DomainName: !GetAtt S3StaticHostingBucket.RegionalDomainName
+            Id: the-s3-bucket
+            S3OriginConfig:
+              OriginAccessIdentity:
+                !Join [
+                  "",
+                  [
+                    "origin-access-identity/cloudfront/",
+                    !Ref CloudFrontOriginAccessIdentity,
+                  ],
+                ]
+
+  # Create the CloudFront Origin Access Identity
+  CloudFrontOriginAccessIdentity:
+    Type: AWS::CloudFront::CloudFrontOriginAccessIdentity
+    Properties:
+      CloudFrontOriginAccessIdentityConfig:
+        Comment: "CloudFront OAI for static website"
+
+  # Bucket policy for the S3 bucket hosting the static website
+  StaticHostingBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      PolicyDocument:
+        Statement:
+          - Action:
+              - s3:GetObject
+            Effect: Allow
+            Resource: !Join ["", [!GetAtt S3StaticHostingBucket.Arn, "/*"]]
+            Principal:
+              CanonicalUser: !GetAtt CloudFrontOriginAccessIdentity.S3CanonicalUserId
+      Bucket: !Ref S3StaticHostingBucket
+
+  # Lambda function and role for handling the API gateway requests
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: "sts:AssumeRole"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+
+  LambdaFunctionForAPIGateway:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: "index.handler"
+      Description: "Lambda for the API Gateway"
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import logging
+          import boto3
+
+          LOGGER = logging.getLogger(__name__)
+          LOGGER.setLevel(logging.INFO)
+
+          def handler(event, context):
+               # Serialize the object
+               serializedListObject = json.dumps(event)
+               client = boto3.client('s3')
+               client.put_object(Bucket='lambda-upload', Key='anotherfilename.txt', Body=serializedListObject)
+               return {
+                   'body': serializedListObject,
+                   'headers': {
+                       'Content-Type': 'application/json',
+                       'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token',
+                       'Access-Control-Allow-Origin': <PROVIDE YOUR DOMAIN HERE>,
+                       'Access-Control-Allow-Methods': 'OPTIONS,POST'
+                    },
+                   'statusCode': 200
+               }
+
+      Runtime: "python3.7"
+      Timeout: 60
+
+  # REST API using the API Gateway
+  APIGatewayRestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Ref ApiName
+      Description: API Gateway for the static website
+      Policy:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal: "*"
+            Action: "execute-api:Invoke"
+            Resource: "*"
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      Tags:
+        - Key: Name
+          Value: !Ref ApiName
+
+  # Submit resource with POST method
+  SubmitResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref APIGatewayRestApi
+      ParentId: !GetAtt APIGatewayRestApi.RootResourceId
+      PathPart: "submit"
+  OptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      RestApiId: !Ref APIGatewayRestApi
+      ResourceId: !Ref SubmitResource
+      HttpMethod: "OPTIONS"
+      Integration:
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'OPTIONS,POST'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        Type: "MOCK"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: 'Empty'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: false
+            method.response.header.Access-Control-Allow-Methods: false
+            method.response.header.Access-Control-Allow-Origin: false
+  PostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref APIGatewayRestApi
+      ResourceId: !Ref SubmitResource
+      HttpMethod: "POST"
+      AuthorizationType: NONE
+      Integration:
+        IntegrationHttpMethod: "POST"
+        Type: "AWS_PROXY"
+        Uri: !Sub
+          - "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${lambdaArn}/invocations"
+          - lambdaArn: !GetAtt LambdaFunctionForAPIGateway.Arn
+
+  # Stage and deployment of the API gateway
+  APIDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - PostMethod
+    Properties:
+      RestApiId: !Ref APIGatewayRestApi
+      StageName: !Ref StageName
+
+  # Permission for API Gateway to invoke the Lambda
+  LambdaAPIGatewayInvoke:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: "lambda:InvokeFunction"
+      FunctionName: !GetAtt LambdaFunctionForAPIGateway.Arn
+      Principal: "apigateway.amazonaws.com"
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${APIGatewayRestApi}/*/POST/submit"
+
+Outputs:
+  WebsiteURL:
+    Value: !Join ["", ["https://", !GetAtt [CloudFrontDistribution, DomainName]]]
+    Description: URL for static website dashboard

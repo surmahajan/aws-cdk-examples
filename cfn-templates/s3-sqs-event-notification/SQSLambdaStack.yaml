@@ -1,0 +1,148 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "SQS queue and Lambda for processing the documents"
+Parameters:
+  Environment:
+    Description: "Environment Name"
+    Type: "String"
+  QueueName:
+    Default: "FileIngestionQueue"
+    Description: "Queue to hold all the documents metadata from S3 bucket"
+    Type: "String"
+  DeadLetterQueueName:
+    Default: "FileIngestionDeadLetterQueue"
+    Description: "Queue to hold all the failed messages"
+    Type: "String"
+
+Resources:
+  MyQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${QueueName}-${Environment}"
+      VisibilityTimeout: 60
+      KmsMasterKeyId: "FileIngestionKey"
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DeadLetterQueue.Arn
+        maxReceiveCount: 5
+
+  SQSPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref MyQueue
+      PolicyDocument:
+        Statement:
+          - Action:
+              - "SQS:SendMessage"
+              - "SQS:ReceiveMessage"
+            Effect: "Allow"
+            Resource: !GetAtt MyQueue.Arn
+            Principal:
+              Service:
+                - "s3.amazonaws.com"
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${DeadLetterQueueName}-${Environment}"
+      VisibilityTimeout: 60
+      KmsMasterKeyId: "FileIngestionKey"
+
+  DeadLetterSQSPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref DeadLetterQueue
+      PolicyDocument:
+        Statement:
+          - Action:
+              - "SQS:*"
+            Effect: "Allow"
+            Resource: !GetAtt DeadLetterQueue.Arn
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service: "lambda.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Policies:
+        - PolicyName: lambdaInlinePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                  - sqs:ChangeMessageVisibility
+                Resource: !GetAtt MyQueue.Arn
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:PutParameter
+                Resource: "*"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+        - "arn:aws:iam::aws:policy/AmazonCognitoPowerUser"
+
+# TODO: s3 cross account access, key alias, lambda sqs mapping, lambda execution role, cognito client, cognito user, secret manager, Secret Rotation, Custom Resource for Setting the password (User creation and pwd set in prod?)
+  FileIngestionKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: CMK
+      KeyPolicy:
+        Version: "2012-10-17"
+        Id: fileingestion-key-policy
+        Statement:
+        - Sid: Enable root permission for admin
+          Effect: Allow
+          Principal:
+            AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+          Action:
+            - "kms:*"
+          Resource: "*"
+        - Sid: Allow S3 to decrypt SQS key
+          Effect: Allow
+          Principal:
+            Service: "s3.amazonaws.com"
+          Action:
+            - kms:GenerateDataKey
+            - kms:Decrypt
+          Resource: "*"
+        - Sid: Allow Lambda to decrypt SQS key
+          Effect: Allow
+          Principal:
+            Service: "lambda.amazonaws.com"
+          Action:
+            - kms:GenerateDataKey
+            - kms:Decrypt
+          Resource: "*"
+
+
+Outputs:
+  FileIngestionQueueArnName:
+    Description: The ARN name of the FileIngestion Queue to be used for Lambda Queue Mapping
+    Value: !GetAtt MyQueue.Arn
+    Export:
+      Name: !Sub "${Environment}-FileIngestionQueueArn"
+  FileIngestionLambdaRoleArnName:
+    Description: The ARN name of the FileIngestion Lambda Role
+    Value: !GetAtt LambdaRole.Arn
+    Export:
+      Name: !Sub "${Environment}-FileIngestionLambdaRoleArn"
